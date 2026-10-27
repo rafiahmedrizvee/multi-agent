@@ -1,17 +1,17 @@
 import re
 import time
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import ollama
 
 
 LOCAL_MODEL = "qwen2.5:3b"
 
-MAX_ANALYSIS_CHARS = 1500
+MAX_ANALYSIS_CHARS = 1800
 MAX_SOURCE_TITLE_CHARS = 150
-MAX_SOURCE_EXCERPT_CHARS = 700
-MAX_OUTPUT_TOKENS = 700
-MAX_REPAIR_TOKENS = 700
+MAX_SOURCE_EXCERPT_CHARS = 900
+MAX_OUTPUT_TOKENS = 750
+MAX_REPAIR_TOKENS = 750
 
 REQUIRED_SECTIONS = (
     "Introduction",
@@ -20,6 +20,16 @@ REQUIRED_SECTIONS = (
     "Limitations",
     "Conclusion",
 )
+
+PLACEHOLDER_TITLES = {
+    "a specific title about the topic",
+    "descriptive title",
+    "your title here",
+    "insert title",
+    "title goes here",
+    "untitled",
+    "research report",
+}
 
 
 def _normalize_url(url: object) -> str:
@@ -43,6 +53,50 @@ def _normalize_url(url: object) -> str:
         url = url[1:-1].strip()
 
     return url
+
+
+def _canonicalize_url(url: str) -> str:
+    """Normalize common URL variations for duplicate detection."""
+    try:
+        parsed = urlparse(url.strip())
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower()
+        if not scheme or not hostname:
+            return url.strip()
+
+        # www is usually a presentation variant, not a different article.
+        if hostname.startswith("www."):
+            hostname = hostname[4:]
+
+        port = parsed.port
+        netloc = hostname
+        if port and not (
+            (scheme == "http" and port == 80)
+            or (scheme == "https" and port == 443)
+        ):
+            netloc = f"{hostname}:{port}"
+
+        # Ignore common tracking parameters while preserving content parameters.
+        tracking_prefixes = ("utm_",)
+        tracking_names = {
+            "fbclid", "gclid", "dclid", "mc_cid", "mc_eid",
+            "ref", "source", "campaign",
+        }
+        query_items = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.lower() not in tracking_names
+            and not key.lower().startswith(tracking_prefixes)
+        ]
+        query = urlencode(sorted(query_items), doseq=True)
+
+        path = re.sub(r"/{2,}", "/", parsed.path or "/")
+        if path != "/":
+            path = path.rstrip("/")
+
+        return urlunparse((scheme, netloc, path, "", query, ""))
+    except (ValueError, AttributeError):
+        return url.strip()
 
 
 def _is_valid_http_url(url: object) -> bool:
@@ -71,7 +125,7 @@ def _clean_title(title: object) -> str:
 
 
 def _build_sources(sources: list[dict]) -> tuple[list[dict], str, str]:
-    """Validate sources and create concise source context and Markdown."""
+    """Validate and deduplicate sources; create context and Markdown."""
     valid_sources = []
     context_lines = []
     markdown_lines = []
@@ -82,10 +136,14 @@ def _build_sources(sources: list[dict]) -> tuple[list[dict], str, str]:
             continue
 
         url = _normalize_url(source.get("url"))
-        if not _is_valid_http_url(url) or url in seen_urls:
+        if not _is_valid_http_url(url):
             continue
 
-        seen_urls.add(url)
+        canonical_url = _canonicalize_url(url)
+        if canonical_url in seen_urls:
+            continue
+
+        seen_urls.add(canonical_url)
         title = _clean_title(source.get("title"))
         valid_source = {**source, "title": title, "url": url}
         valid_sources.append(valid_source)
@@ -160,7 +218,8 @@ def _empty_sections(report: str) -> list[str]:
             flags=re.IGNORECASE,
         )
         start = next(
-            (i + 1 for i, line in enumerate(lines) if heading_pattern.match(line.strip())),
+            (i + 1 for i, line in enumerate(lines)
+             if heading_pattern.match(line.strip())),
             None,
         )
         if start is None:
@@ -182,15 +241,58 @@ def _empty_sections(report: str) -> list[str]:
 def _invalid_citations(report: str, source_count: int) -> list[str]:
     """Find numeric citations that refer to nonexistent sources."""
     found = set(re.findall(r"(?<!\!)\[(\d+)\]", report))
-    invalid = []
-    for number in sorted(found, key=int):
-        if int(number) < 1 or int(number) > source_count:
-            invalid.append(number)
-    return invalid
+    return [
+        number for number in sorted(found, key=int)
+        if int(number) < 1 or int(number) > source_count
+    ]
 
 
-def _validation_issues(report: str, source_count: int) -> dict:
-    """Collect structural and citation validation issues."""
+def _title_from_topic(topic: str) -> str:
+    """Build a usable, deterministic report title from the user's topic."""
+    title = re.sub(r"\s+", " ", str(topic or "")).strip()
+    # If the prompt contains multiple sentences, use the first as the title basis.
+    title = re.split(r"(?<=[.!?])\s+", title, maxsplit=1)[0].strip(" .!?")
+    # Remove common instruction prefixes while preserving the actual subject.
+    title = re.sub(
+        r"(?i)^(?:please\s+)?(?:research|investigate|explore|analyze|analyse|"
+        r"examine|study|review)\s+(?:the\s+)?(?:role\s+of\s+)?",
+        "",
+        title,
+    )
+    title = re.sub(r"(?i)^the role of\s+", "", title)
+    title = title.strip(" .:;—-")
+    if not title:
+        title = "Research Report"
+    if len(title) > 110:
+        title = title[:107].rsplit(" ", 1)[0].rstrip(" ,:;-") + "..."
+    return title[0].upper() + title[1:] if title else "Research Report"
+
+
+def _ensure_valid_title(report: str, topic: str) -> str:
+    """Replace missing/placeholder H1 titles without another model call."""
+    title_match = re.search(r"(?m)^#\s+(.+?)\s*#*\s*$", report)
+    title = title_match.group(1).strip() if title_match else ""
+    bad_title = (
+        not title
+        or title.lower() in PLACEHOLDER_TITLES
+        or bool(re.search(
+            r"(?i)\b(descriptive title|your title here|insert title|"
+            r"title goes here|a specific title about the topic)\b",
+            title,
+        ))
+    )
+    if not bad_title:
+        return report.strip()
+
+    fallback_title = _title_from_topic(topic)
+    if title_match:
+        start, end = title_match.span()
+        return (report[:start] + f"# {fallback_title}" + report[end:]).strip()
+    return f"# {fallback_title}\n\n{report.strip()}".strip()
+
+
+def _validation_issues(report: str, source_count: int, topic: str = "") -> dict:
+    """Collect structural, title, citation, and basic topic-coverage issues."""
     missing = _missing_sections(report)
     empty = _empty_sections(report)
     invalid_citations = _invalid_citations(report, source_count)
@@ -199,19 +301,54 @@ def _validation_issues(report: str, source_count: int) -> dict:
     title = title_match.group(1).strip() if title_match else ""
     invalid_title = (
         not title
+        or title.lower() in PLACEHOLDER_TITLES
         or bool(
             re.search(
-                r"(?i)\b(descriptive title|your title here|insert title|title goes here)\b",
+                r"(?i)\b(descriptive title|your title here|insert title|"
+                r"title goes here|a specific title about the topic)\b",
                 title,
             )
         )
     )
+
+    # Basic deterministic coverage check for software-development research.
+    topic_and_report = f"{topic}\n{report}"
+    software_topic = bool(re.search(
+        r"\b(software development|software engineering|coding|code generation|"
+        r"developer productivity|AI agents?)\b",
+        topic_and_report,
+        flags=re.IGNORECASE,
+    ))
+    coverage_terms = {
+        "code_generation": r"\b(code generation|generate code|coding assistance)\b",
+        "debugging": r"\b(debugging|debug|bug fixing|fix bugs)\b",
+        "automated_testing": r"\b(automated testing|test automation|unit tests|"
+                             r"automated tests)\b",
+        "code_review": r"\b(code review|reviewing code|pull request review)\b",
+        "deployment": r"\b(deployment|deploying|software release|release automation)\b",
+        "security_risks": r"\b(security risks?|vulnerabilit(?:y|ies)|prompt injection|"
+                           r"data leakage|supply.chain)\b",
+        "limitations": r"\b(limitations?|challenges?|failure|unreliable|"
+                       r"human oversight|hallucination)\b",
+        "future_opportunities": r"\b(future opportunities|future potential|emerging "
+                                r"opportunities|future directions|outlook)\b",
+    }
+    required_coverage = (
+        coverage_terms if software_topic else {
+            "limitations": coverage_terms["limitations"]
+        }
+    )
+    missing_coverage = [
+        name for name, pattern in required_coverage.items()
+        if not re.search(pattern, report, flags=re.IGNORECASE)
+    ]
 
     return {
         "missing_sections": missing,
         "empty_sections": empty,
         "invalid_citations": invalid_citations,
         "invalid_title": invalid_title,
+        "missing_coverage": missing_coverage,
     }
 
 
@@ -224,11 +361,11 @@ def _generate_report(prompt: str, max_tokens: int) -> tuple[str, str | None, flo
             {
                 "role": "system",
                 "content": (
-                    "You are a careful research report writer. "
-                    "Return complete Markdown only. Follow the exact required "
-                    "headings. Use only supplied findings and source excerpts. "
-                    "Never invent facts, statistics, URLs, or citations. "
-                    "Be concise and finish every section."
+                    "You are a careful research report writer. Return complete "
+                    "Markdown only. Use the exact required headings. Use only "
+                    "supplied findings and source excerpts. Never invent facts, "
+                    "statistics, URLs, or citations. Use a real, topic-specific "
+                    "title, never a placeholder. Be concise and finish every section."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -246,22 +383,29 @@ def _make_prompt(topic: str, analysis: str, source_context: str) -> str:
         f"Research topic: {topic}\n\n"
         f"Analyst findings:\n{analysis[:MAX_ANALYSIS_CHARS]}\n\n"
         f"Sources and excerpts:\n{source_context}\n\n"
-        "Write a concise Markdown research report of about 180-250 words "
-        "(source list excluded). Start with one specific H1 title about the "
-        "actual topic, not a placeholder. Use these exact headings, in order:\n"
-        "# A specific title about the topic\n"
+        "Write a concise but useful Markdown research report of about 300-450 "
+        "words (source list excluded). Create a meaningful H1 title using the "
+        "actual research topic. Never copy example titles or placeholder text.\n"
+        "Use these exact headings, in order:\n"
         "## Introduction\n"
         "## Key Findings\n"
         "## Evidence and Citations\n"
         "## Limitations\n"
         "## Conclusion\n\n"
         "Instructions:\n"
-        "- Write 1-3 short sentences under every heading.\n"
-        "- Cover the topic's main subtopics.\n"
-        "- Support factual claims with relevant inline citations such as [1].\n"
-        "- In Evidence and Citations, explain what the cited excerpts support.\n"
-        "- Cite only the supplied source numbers; never invent evidence.\n"
-        "- If evidence is insufficient, state that explicitly.\n"
+        "- Put one specific, informative H1 title on the first line.\n"
+        "- In Key Findings, use separate labeled bullets for each major subtopic "
+        "in the user's research request. For software-development AI-agent "
+        "research, cover code generation, debugging, automated testing, code "
+        "review, and deployment separately whenever relevant.\n"
+        "- Discuss concrete security risks, limitations, and future opportunities "
+        "when relevant to the research question.\n"
+        "- Support factual claims with inline citations such as [1] or [2].\n"
+        "- In Evidence and Citations, explain which source supports which claim; "
+        "do not merely list citation numbers.\n"
+        "- Cite only supplied source numbers. Do not imply a source supports a "
+        "claim unless its supplied excerpt provides relevant evidence.\n"
+        "- If evidence is insufficient for a subtopic, say so explicitly.\n"
         "- Do not add a Sources heading; the application appends it.\n"
         "- Return the report only, with no preamble or code fences."
     )
@@ -278,19 +422,22 @@ def _make_repair_prompt(
         f"Research topic: {topic}\n"
         f"Analyst findings: {analysis[:MAX_ANALYSIS_CHARS]}\n"
         f"Sources and excerpts:\n{source_context}\n\n"
-        f"Previous draft to correct (may be incomplete):\n{previous_report[:3500]}\n\n"
-        "Rewrite the entire report, concise (180-250 words), as Markdown. "
-        "Start with one specific H1 title. Include these exact headings in "
-        "this order, each with 1-3 short sentences:\n"
-        "# A specific title about the topic\n"
+        f"Previous draft to correct:\n{previous_report[:4000]}\n\n"
+        "Rewrite the entire report as complete Markdown, about 300-450 words. "
+        "Create a meaningful H1 title based on the actual topic. Never use a "
+        "placeholder title. Include these exact H2 headings in this order:\n"
         "## Introduction\n"
         "## Key Findings\n"
         "## Evidence and Citations\n"
         "## Limitations\n"
         "## Conclusion\n\n"
-        f"Only cite source numbers from 1 to {source_count}. "
-        "Use only supplied evidence; do not invent claims or citations. "
-        "Do not add a Sources heading. Return only the complete report."
+        "Correct every reported issue. Cover the user's requested subtopics "
+        "separately; for software-development AI-agent research, include code "
+        "generation, debugging, automated testing, code review, deployment, "
+        "security risks, limitations, and future opportunities when relevant. "
+        "Explain which source supports each key claim. Only cite source numbers "
+        f"from 1 to {source_count}. Use only supplied evidence. Do not add a "
+        "Sources heading. Return only the complete report."
     )
 
 
@@ -320,7 +467,8 @@ def write_report(topic: str, analysis: str, sources: list[dict]) -> dict:
 
     try:
         print(
-            f"[Writer Agent] Starting report generation with {len(valid_sources)} valid sources."
+            f"[Writer Agent] Starting report generation with "
+            f"{len(valid_sources)} unique valid sources."
         )
         prompt = _make_prompt(topic, analysis, source_context)
         report, done_reason, elapsed = _generate_report(prompt, MAX_OUTPUT_TOKENS)
@@ -337,7 +485,10 @@ def write_report(topic: str, analysis: str, sources: list[dict]) -> dict:
             }
 
         report = _clean_report(report)
-        issues = _validation_issues(report, len(valid_sources))
+        # Fix placeholder/missing titles locally; avoid another slow model call
+        # for a deterministic formatting problem.
+        report = _ensure_valid_title(report, topic)
+        issues = _validation_issues(report, len(valid_sources), topic)
         truncated = str(done_reason or "").lower() == "length"
 
         def score(validation: dict, was_truncated: bool) -> int:
@@ -345,6 +496,7 @@ def write_report(topic: str, analysis: str, sources: list[dict]) -> dict:
                 len(validation["missing_sections"])
                 + len(validation["empty_sections"])
                 + len(validation["invalid_citations"])
+                + len(validation["missing_coverage"])
                 + int(validation["invalid_title"])
                 + int(was_truncated)
             )
@@ -361,18 +513,28 @@ def write_report(topic: str, analysis: str, sources: list[dict]) -> dict:
                 repair_prompt, MAX_REPAIR_TOKENS
             )
             print(f"[Writer Agent] Repair generation: {repair_elapsed:.2f}s")
-            print(f"[Writer Agent] Repair stop reason: {repair_reason or 'unknown'}")
+            print(
+                f"[Writer Agent] Repair stop reason: "
+                f"{repair_reason or 'unknown'}"
+            )
 
             if repaired:
                 repaired = _clean_report(repaired)
-                repaired_issues = _validation_issues(repaired, len(valid_sources))
+                repaired = _ensure_valid_title(repaired, topic)
+                repaired_issues = _validation_issues(
+                    repaired, len(valid_sources), topic
+                )
                 repaired_truncated = str(repair_reason or "").lower() == "length"
 
-                # Keep the draft with fewer validation failures. Prefer repaired
-                # on ties only when it is not truncated and original was truncated.
-                if score(repaired_issues, repaired_truncated) < score(issues, truncated):
+                # Keep whichever draft has fewer validation failures.
+                if score(repaired_issues, repaired_truncated) < score(
+                    issues, truncated
+                ):
                     report, issues, done_reason, truncated = (
-                        repaired, repaired_issues, repair_reason, repaired_truncated
+                        repaired,
+                        repaired_issues,
+                        repair_reason,
+                        repaired_truncated,
                     )
 
         complete = (
@@ -380,6 +542,7 @@ def write_report(topic: str, analysis: str, sources: list[dict]) -> dict:
             and not issues["empty_sections"]
             and not issues["invalid_citations"]
             and not issues["invalid_title"]
+            and not issues["missing_coverage"]
             and not truncated
         )
 
@@ -388,7 +551,10 @@ def write_report(topic: str, analysis: str, sources: list[dict]) -> dict:
 
         total_elapsed = time.perf_counter() - total_start
         print(f"[Writer Agent] Final validation: {issues}")
-        print(f"[Writer Agent] Complete: {complete}; total time: {total_elapsed:.2f}s")
+        print(
+            f"[Writer Agent] Complete: {complete}; "
+            f"total time: {total_elapsed:.2f}s"
+        )
 
         result = {
             "status": "success" if complete else "incomplete",
@@ -403,13 +569,14 @@ def write_report(topic: str, analysis: str, sources: list[dict]) -> dict:
             result.update(
                 {
                     "message": (
-                        "The report did not pass all structural validation checks. "
+                        "The report did not pass all validation checks. "
                         "Review it before relying on its claims."
                     ),
                     "missing_sections": issues["missing_sections"],
                     "empty_sections": issues["empty_sections"],
                     "invalid_citations": issues["invalid_citations"],
                     "invalid_title": issues["invalid_title"],
+                    "missing_coverage": issues["missing_coverage"],
                     "generation_limit_reached": truncated,
                 }
             )
